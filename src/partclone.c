@@ -78,6 +78,20 @@ int log_y_line = 0;
 #define OPT_READ_DIRECT_IO 1002
 #define OPT_BINARY_PREFIX 1003
 #define OPT_PROG_SEC 1004
+
+#define OPT_SRC_MODE 1010
+#define OPT_SRC_HEAD 1011
+#define OPT_SRC_BITMAP 1012
+#define OPT_SRC_BLK_BEG 1013
+#define OPT_SRC_BLK_END 1014
+
+#define OPT_TGT_MODE 1020
+#define OPT_TGT_HEAD 1021
+#define OPT_TGT_BITMAP 1022
+#define OPT_TGT_BLK_BEG 1023
+#define OPT_TGT_BLK_END 1024
+
+
 //
 //enum {
 //	OPT_OFFSET_DOMAIN = 1000
@@ -143,15 +157,15 @@ void set_image_options_v2(image_options* img_opt)
 	img_opt->bitmap_mode = BM_BIT;
 }
 
-void init_image_head_v1(image_head_v1* image_hdr, char* fs)
+void init_image_desc_v1(image_head_v1* image_hdr, char* fs)
 {
 	memset(image_hdr, 0, sizeof(image_head_v1));
-        memcpy(image_hdr->magic,   IMAGE_MAGIC, IMAGE_MAGIC_SIZE);
+    memcpy(image_hdr->magic,   IMAGE_MAGIC, IMAGE_MAGIC_SIZE);
 	memcpy(image_hdr->version, IMAGE_VERSION_0001, IMAGE_VERSION_SIZE);
 	memcpy(image_hdr->fs, fs, FS_MAGIC_SIZE);
 }
 
-void init_image_head_v2(image_head_v2* image_hdr) {
+void init_image_desc_v2(image_head_v2* image_hdr) {
 
 	int cplen = 0;
 	memset(image_hdr, 0, sizeof(image_head_v2));
@@ -281,7 +295,18 @@ void usage(void) {
 		"    -t,  --btfiles_torrent  Restore block as file for ClonezillaBT but only generate torrent\n"
 #endif
 		"    -v,  --version          Display partclone version\n"
-		"    -h,  --help             Display this help\n"
+
+		"    --src_mode=MODE         source  mode (HEAD|BITMAP|BLK)\n"
+		"    --src_blk_begin=X		 source block begin(output source)\n"
+		"    --src_blk_end=X		 source block end(source offset)\n"
+
+		"    --tgt_mode=MODE  		 target mode (HEAD|BITMAP|BLK)\n"
+		"    --tgt_head=PATH  		 target head (when BLK)\n"
+		"    --tgt_bitmap=PATH    	 target bitmap (when BLK)\n"
+		"    --tgt_blk_begin=X		 target offset begin(output offset)\n"
+		"    --tgt_blk_end=X		 target offset end(output offset)\n"
+
+		"    -h,  --help 			 Display this help\n"
 		, get_exec_name(), VERSION, get_exec_name(), DEFAULT_BUFFER_SIZE);
 	exit(1);
 }
@@ -333,6 +358,20 @@ static void save_program_name(const char* argv0) {
 	}
 }
 
+int rz_to_dump_mode(char *arg){
+	if (strcmp(arg, "HEAD") == 0 || strcmp(arg, "head") == 0) {
+		return RZ_HEAD;
+	} else if (strcmp(arg, "BITMAP") == 0 || strcmp(arg, "bitmap") == 0) {
+		return RZ_BITMAP;
+	} else if (strcmp(arg, "BLK") == 0 || strcmp(arg, "blk") == 0) {
+		return RZ_BLOCK;
+	} else {
+		fprintf(stderr, "Unknown mode '%s'.\n", arg);
+		usage();
+		return 0;
+	}
+}
+
 void parse_options(int argc, char **argv, cmd_opt* opt) {
 
 #if CHKIMG
@@ -363,6 +402,7 @@ void parse_options(int argc, char **argv, cmd_opt* opt) {
 		{ "prog-second",        no_argument,	        NULL,   OPT_PROG_SEC },
 		{ "write-direct-io",	no_argument,	        NULL,   OPT_WRITE_DIRECT_IO },
 		{ "read-direct-io",	no_argument,	        NULL,   OPT_READ_DIRECT_IO },
+
 // not RESTORE and not CHKIMG
 #ifndef CHKIMG
 #ifndef RESTORE
@@ -395,6 +435,20 @@ void parse_options(int argc, char **argv, cmd_opt* opt) {
 #ifdef HAVE_LIBNCURSESW
 		{ "ncurses",		no_argument,		NULL,   'N' },
 #endif
+
+		{ "src_mode",       required_argument,       NULL, OPT_SRC_MODE },
+		{ "src_head",  		required_argument,       NULL, OPT_SRC_HEAD },
+		{ "src_bitmap",    	required_argument,       NULL, OPT_SRC_BITMAP },
+		{ "src_blk_begin",  required_argument,       NULL, OPT_SRC_BLK_BEG },
+		{ "src_blk_end",    required_argument,       NULL, OPT_SRC_BLK_END },
+
+		{ "tgt_mode",       required_argument,       NULL, OPT_TGT_MODE },
+		{ "tgt_head",       required_argument,       NULL, OPT_TGT_HEAD },
+		{ "tgt_bitmap",     required_argument,       NULL, OPT_TGT_BITMAP },
+		{ "tgt_blk_begin",  required_argument,       NULL, OPT_TGT_BLK_BEG },
+		{ "tgt_blk_end",    required_argument,       NULL, OPT_TGT_BLK_END },
+
+
 		{ NULL,			0,			NULL,    0  }
 	};
 
@@ -575,6 +629,48 @@ void parse_options(int argc, char **argv, cmd_opt* opt) {
 				opt->ncurses = 1;
 				break;
 #endif
+
+                        case OPT_SRC_MODE:
+                            opt->src_mode = rz_to_dump_mode(optarg);
+							fprintf(stderr,"src_mode: %d, arg=%s\n", opt->src_mode,optarg);							
+						    break;
+						case OPT_SRC_BLK_BEG:
+							opt->src_blk_beg = (off_t)atol(optarg);
+							fprintf(stderr,"src_blk_beg: %lld\n", opt->src_blk_beg);
+						break;
+						case OPT_SRC_BLK_END:
+							opt->src_blk_end = (off_t)atol(optarg);
+							fprintf(stderr,"src_blk_end: %lld\n", opt->src_blk_end);
+						break;
+						case OPT_SRC_HEAD:
+							opt->src_head_path = optarg;
+							printf("src_head_path: %s\n", opt->src_head_path);
+						break;
+						case OPT_SRC_BITMAP:
+							opt->src_bitmap_path = optarg;
+							fprintf(stderr,"src_bitmap_path: %s\n", opt->src_bitmap_path);
+						break;						
+ 
+                        case OPT_TGT_MODE:
+                            opt->tgt_mode =rz_to_dump_mode(optarg);
+							fprintf(stderr,"tgt_mode: %d, arg=%s\n", opt->tgt_mode,optarg);
+                        break;
+						case OPT_TGT_HEAD:
+							opt->tgt_head_path = optarg;
+							fprintf(stderr,"tgt_head_path: %s\n", opt->tgt_head_path);
+						break;
+						case OPT_TGT_BITMAP:
+							opt->tgt_bitmap_path = optarg;
+							fprintf(stderr,"tgt_bitmap_path: %s\n", opt->tgt_bitmap_path);
+						break;
+						case OPT_TGT_BLK_BEG:
+							opt->tgt_blk_beg = (off_t)atol(optarg);
+							fprintf(stderr,"tgt_blk_beg: %lld\n", opt->tgt_blk_beg);
+						break;
+						case OPT_TGT_BLK_END:
+							opt->tgt_blk_end = (off_t)atol(optarg);
+							fprintf(stderr,"tgt_blk_end: %lld\n", opt->tgt_blk_end);
+						break;						
 			default:
 				fprintf(stderr, "Unknown option '%s'.\n", argv[optind-1]);
 				usage();
@@ -980,7 +1076,7 @@ void load_image_desc(int* ret, cmd_opt* opt, image_head_v2* img_head, file_syste
 			log_mesg(0, 1, 1, debug, "read image_hdr error=%d\n (%s)", r_size, strerror(errno));
 
 		load_image_desc_v1(fs_info, img_opt, buf_v1->head, buf_v1->fs_info, opt);
-		memset(img_head, 0, sizeof(image_head_v2));
+		memset(img_head, 0, sizeof(image_desc_v2));
 		break;
 	}
 
@@ -994,7 +1090,7 @@ void load_image_desc(int* ret, cmd_opt* opt, image_head_v2* img_head, file_syste
 			log_mesg(0, 1, 1, debug, "Invalid header checksum [0x%08X != 0x%08X]\n", crc, buf_v2.crc);
 
 		load_image_desc_v2(fs_info, img_opt, buf_v2.head, buf_v2.fs_info, buf_v2.options, opt);
-		memcpy(img_head, &(buf_v2.head), sizeof(image_head_v2));
+		memcpy(img_head, &(buf_v2.head), sizeof(image_desc_v2));
 		break;
 	}
 
@@ -1014,13 +1110,21 @@ void write_image_desc(int* ret, file_system_info fs_info, image_options img_opt,
 
 	image_desc_v2 buf_v2;
 
-	init_image_head_v2(&buf_v2.head);
+	init_image_desc_v2(&buf_v2.head);
 
 	memcpy(&buf_v2.fs_info, &fs_info, sizeof(file_system_info));
 	memcpy(&buf_v2.options, &img_opt, sizeof(image_options));
 
 	init_crc32(&buf_v2.crc);
 	buf_v2.crc = crc32(buf_v2.crc, &buf_v2, sizeof(image_desc_v2) - CRC32_SIZE);
+
+	//@ADD
+	if(opt->tgt_mode == RZ_BLOCK) {
+		//strncpy(buf_v2.head.desc, opt->tgt_head_path, DESC_MAGIC_SIZE);
+		log_mesg(1, 0, 0, opt->debug, "DBG : writing image header(DESC) to tgt_head_path=%s\n",opt->tgt_head_path);
+	}
+
+	log_mesg(1, 0, 0, opt->debug, "DBG : writing image header(DESC) to image (sz=%d)\n",sizeof(image_desc_v2));
 
 	if (write_all(ret, (char*)&buf_v2, sizeof(image_desc_v2), opt) != sizeof(image_desc_v2))
 		log_mesg(0, 1, 1, opt->debug, "error writing image header to image: %s\n", strerror(errno));
@@ -1036,6 +1140,8 @@ void write_image_bitmap(int* ret, file_system_info fs_info, image_options img_op
 
 	case BM_BIT:
 	{
+		log_mesg(1, 0, 0, debug, "DBG : write bitmap.1 to BIT :tot=%u , bitmap.sz=%u \n",fs_info.totalblock,BITS_TO_BYTES(fs_info.totalblock));
+
 		if (write_all(ret, (char*)bitmap, BITS_TO_BYTES(fs_info.totalblock), opt) == -1)
 			log_mesg(0, 1, 1, debug, "write bitmap to image error: %s\n", strerror(errno));
 		break;
@@ -1045,6 +1151,7 @@ void write_image_bitmap(int* ret, file_system_info fs_info, image_options img_op
 	{
 		char bbuffer[16384];
 
+		log_mesg(1, 0, 0, debug, "DBG : write bitmap.2 to BYTE :tot=%u \n",fs_info.totalblock);
 		for (i = 0; i < fs_info.totalblock; ++i) {
 
 			bbuffer[i % sizeof(bbuffer)] = pc_test_bit(i, bitmap, fs_info.totalblock);

@@ -48,10 +48,13 @@
 #include "progress.h"
 
 void *thread_update_pui(void *arg);
+
 /// progress_bar structure defined in progress.h
 progress_bar prog;
 unsigned long long copied;
 unsigned long long block_id;
+unsigned long long block_beg_id;
+unsigned long long block_end_id;
 int done;
 
 #include "partclone.h"
@@ -63,6 +66,10 @@ cmd_opt opt;
 
 /// fs option
 #include "fs_common.h"
+
+unsigned long long to_block_id_from_used_block_idx(unsigned long long* used_block_idxs,unsigned long long* used_block_ids, file_system_info fs_info, unsigned char *bitmap, cmd_opt *opt) ;
+
+
 /// cmd_opt structure defined in partclone.h
 fs_cmd_opt fs_opt;
 
@@ -130,8 +137,8 @@ int main(int argc, char **argv) {
 	//if(opt.debug)
 	open_log(opt.logfile);
 
-        struct tm *ptm = gmtime(&now);
-        log_mesg(1, 0, 0, debug, "Partclone log start at UTC %s", asctime(ptm));
+    struct tm *ptm = gmtime(&now);
+    log_mesg(1, 0, 0, debug, "Partclone log start at UTC %s", asctime(ptm));
 
 	/**
 	 * using Text User Interface
@@ -172,6 +179,7 @@ int main(int argc, char **argv) {
 	source = opt.source;
 	target = opt.target;
 	log_mesg(1, 0, 0, debug, "source=%s, target=%s \n", source, target);
+	if(RZDBG) log_mesg(0, 0, 1, debug, "source=%s, target=%s \n", source, target);
 	dfr = open_source(source, &opt);
 	if (dfr == -1) {
 		log_mesg(0, 1, 1, debug, "Error exit\n");
@@ -195,6 +203,8 @@ int main(int argc, char **argv) {
 	 * get partition information like super block, bitmap from device or image file.
 	 */
 	if (opt.clone) {
+		int isHeadLoaded=0;
+		int isBitmapLoaded=0;
 
 		log_mesg(1, 0, 0, debug, "Initiate image options - version %s\n", IMAGE_VERSION_CURRENT);
 
@@ -207,10 +217,21 @@ int main(int argc, char **argv) {
 		cs_reseed = img_opt.reseed_checksum;
 
 		log_mesg(1, 0, 0, debug, "Initial image hdr - get Super Block from partition\n");
-		log_mesg(0, 0, 1, debug, "Reading Super Block\n");
+		log_mesg(0, 0, 1, debug, "Reading Super Block : clone\n");
+
+
+		//@ADD	
+		if((opt.src_mode==RZ_BLOCK) && opt.src_head_path!=NULL){
+			log_mesg(1, 0, 0, debug, "Read Super Block from %s\n", opt.src_head_path);
+			read_super_blocks(opt.src_head_path, &fs_info);
+			isHeadLoaded=1;
+		}
 
 		/// get Super Block information from partition
-		read_super_blocks(source, &fs_info);
+		if(isHeadLoaded==0){
+			read_super_blocks(source, &fs_info);
+			isHeadLoaded=1;
+		}
 
 		if (img_opt.checksum_mode != CSM_NONE && img_opt.blocks_per_checksum == 0) {
 
@@ -233,9 +254,24 @@ int main(int argc, char **argv) {
 		log_mesg(2, 0, 0, debug, "initial main bitmap pointer %p\n", bitmap);
 		log_mesg(1, 0, 0, debug, "Initial image hdr - read bitmap table\n");
 
+
+		//@ADD	
+		if((opt.src_mode==RZ_BLOCK) && opt.src_bitmap_path!=NULL){
+			log_mesg(1, 0, 0, debug, "Read Bitmap from %s\n", opt.src_bitmap_path);
+			//read_super_blocks(opt.src_head_path, &fs_info);
+			read_bitmap(opt.src_bitmap_path, fs_info, bitmap, pui);
+			isBitmapLoaded=1;
+		}
+
+
+
 		/// read and check bitmap from partition
-		log_mesg(0, 0, 1, debug, "Calculating bitmap... Please wait... \n");
-		read_bitmap(source, fs_info, bitmap, pui);
+		if(isBitmapLoaded==0){
+			log_mesg(0, 0, 1, debug, "Calculating bitmap... Please wait... \n");
+			read_bitmap(source, fs_info, bitmap, pui);
+			isBitmapLoaded=1;
+		}
+
 		update_used_blocks_count(&fs_info, bitmap);
 
 		/* skip check free space while torrent_only on */
@@ -254,8 +290,23 @@ int main(int argc, char **argv) {
 		log_mesg(1, 0, 0, debug, "Writing super block and bitmap...\n");
 
 		if (opt.blockfile == 0) {
-			write_image_desc(&dfw, fs_info, img_opt, &opt);
-			write_image_bitmap(&dfw, fs_info, img_opt, bitmap, &opt);
+
+			/// write super block and bitmap to image file
+			//@ADD  
+			if(opt.src_mode==RZ_BLOCK){
+				// DO NOTHING !!!!!
+			}else if(opt.src_mode==RZ_HEAD){
+				write_image_desc(&dfw, fs_info, img_opt, &opt);
+			}else if(opt.src_mode==RZ_BITMAP){
+				write_image_bitmap(&dfw, fs_info, img_opt, bitmap, &opt);
+			}else {
+				write_image_desc(&dfw, fs_info, img_opt, &opt);
+				write_image_bitmap(&dfw, fs_info, img_opt, bitmap, &opt);
+			}
+
+			//@ORG
+			// write_image_desc(&dfw, fs_info, img_opt, &opt);
+			// write_image_bitmap(&dfw, fs_info, img_opt, bitmap, &opt);
 		}
 
 		log_mesg(0, 0, 1, debug, "done!\n");
@@ -263,12 +314,32 @@ int main(int argc, char **argv) {
 	} else if (opt.restore) {
 
 		image_head_v2 img_head;
+		int isHeadLoaded=0;
+		int isBitmapLoaded=0;
 
 		log_mesg(1, 0, 0, debug, "restore image hdr - get information from image file\n");
 		log_mesg(1, 0, 1, debug, "Reading Super Block\n");
 
-		/// get image information from image file
-		load_image_desc(&dfr, &opt, &img_head, &fs_info, &img_opt);
+		if(opt.tgt_mode==RZ_BLOCK){
+			log_mesg(0, 0, 1, debug, "Read Head from %s\n", opt.tgt_head_path);
+			// load_image_desc(opt.tgt_head_path, &fs_info);
+			int dfr1 = open_source(opt.tgt_head_path, &opt);
+			if(dfr1 == -1){
+				log_mesg(0, 1, 1, debug, "Error exit: can't open file=%s\n",opt.tgt_head_path);
+			}
+
+			load_image_desc(&dfr1, &opt, &img_head, &fs_info, &img_opt);
+			close(dfr1);
+			
+			isHeadLoaded=1;
+		}
+
+		if(isHeadLoaded==0){
+			/// get image information from image file
+			load_image_desc(&dfr, &opt, &img_head, &fs_info, &img_opt);
+			isHeadLoaded=1;
+		}
+
 		cs_size = img_opt.checksum_size;
 		cs_reseed = img_opt.reseed_checksum;
 
@@ -283,9 +354,29 @@ int main(int argc, char **argv) {
 		log_mesg(2, 0, 0, debug, "initial main bitmap pointer %p\n", bitmap);
 		log_mesg(1, 0, 0, debug, "Initial image hdr - read bitmap table\n");
 
+		if(opt.tgt_mode==RZ_BLOCK){
+			log_mesg(0, 0, 1, debug, "Read Bitmap from %s\n", opt.tgt_bitmap_path);
+
+			int dfr1 = open_source(opt.tgt_bitmap_path, &opt);
+			if(dfr1 == -1){
+				log_mesg(0, 1, 1, debug, "Error exit: can't open file=%s\n",opt.tgt_head_path);
+			}
+			
+			//@read_bitmap(opt.tgt_bitmap_path, fs_info, bitmap, pui);
+			load_image_bitmap(&dfr1, opt, fs_info, img_opt, bitmap);
+			close(dfr1);
+			isBitmapLoaded=1;
+		}
+
+		if(isBitmapLoaded==0){
+			/// read and check bitmap from image file
+			log_mesg(0, 0, 1, debug, "Calculating bitmap... Please wait...\n");
+			load_image_bitmap(&dfr, opt, fs_info, img_opt, bitmap);
+			isBitmapLoaded=1;
+		}
 		/// read and check bitmap from image file
-		log_mesg(0, 0, 1, debug, "Calculating bitmap... Please wait...\n");
-		load_image_bitmap(&dfr, opt, fs_info, img_opt, bitmap);
+		//log_mesg(0, 0, 1, debug, "Calculating bitmap... Please wait...\n");
+		//load_image_bitmap(&dfr, opt, fs_info, img_opt, bitmap);
 
 #ifndef CHKIMG
 		/// check the dest partition size.
@@ -310,7 +401,7 @@ int main(int argc, char **argv) {
 		img_opt.blocks_per_checksum = opt.blocks_per_checksum;
 		img_opt.reseed_checksum = opt.reseed_checksum;
 		log_mesg(1, 0, 0, debug, "Initial image hdr - get Super Block from partition\n");
-		log_mesg(1, 0, 1, debug, "Reading Super Block\n");
+		log_mesg(1, 0, 1, debug, "Reading Super Block - backup \n");
 
 		/// get Super Block information from partition
 		read_super_blocks(source, &fs_info);
@@ -399,7 +490,6 @@ int main(int argc, char **argv) {
 
 		log_mesg(2, 0, 0, debug, "check main bitmap pointer %p\n", bitmap);
 		log_mesg(0, 0, 1, debug, "done!\n");
-    
 	}
 
 	log_mesg(1, 0, 0, debug, "print image information\n");
@@ -436,795 +526,972 @@ int main(int argc, char **argv) {
 	    log_mesg(0, 1, 1, debug, "%s, %i, thread create error\n", __func__, __LINE__);
 
 
-	/**
-	 * start read and write data between source and destination
-	 */
-	if (opt.clone) {
+	//@ADD
+	unsigned long long totalCnt=fs_info.totalblock;
+	unsigned long long usedBlocks=fs_info.usedblocks;
+	unsigned long long blockBeg=0;
+	unsigned long long blockEnd=fs_info.totalblock -1;
 
-		const unsigned long long blocks_total = fs_info.totalblock;
-		const unsigned int block_size = fs_info.block_size;
-		const unsigned int buffer_capacity = opt.buffer_size > block_size ? opt.buffer_size / block_size : 1; // in blocks
-		unsigned char checksum[cs_size];
-		unsigned int blocks_in_cs, blocks_per_cs, write_size;
-		char *read_buffer = NULL, *write_buffer = NULL;
 
-		// SHA1 for torrent info
-		FILE* tinfo = NULL;
-		torrent_generator torrent;
+	int isSkipBlocks=0;
 
-		blocks_per_cs = img_opt.blocks_per_checksum;
+	if(opt.src_mode==RZ_BLOCK){
+		if(opt.src_blk_beg >=0 ) blockBeg=opt.src_blk_beg;
+		if(opt.src_blk_end>0 && opt.src_blk_end>=blockBeg ) blockEnd=opt.src_blk_end;
+	}
+	
+	if(opt.src_mode==RZ_HEAD||opt.src_mode==RZ_BITMAP){
+		isSkipBlocks=1;
+	}
 
-		log_mesg(1, 0, 0, debug, "#\nBuffer capacity = %u, Blocks per cs = %u\n#\n", buffer_capacity, blocks_per_cs);
-
-		write_size = cnv_blocks_to_bytes(0, buffer_capacity, block_size, &img_opt);
-
-                if (opt.read_direct_io == 1){
-                    ret = posix_memalign((void **)&read_buffer, BSIZE, (buffer_capacity * block_size));
-                    if ( ret < 0 ){
-                        log_mesg(0, 1, 1, debug, "%s, %i, memory for read posix_memalign error\n", __func__, __LINE__);
-                    }
-                    memset(read_buffer, 0, (buffer_capacity * block_size));
-                } else {
-                    read_buffer = (char*)malloc(buffer_capacity * block_size);
-                }
-                
-                write_buffer = (char*)malloc(write_size + cs_size);
+	//for TARGET
+	if(opt.tgt_mode==RZ_BLOCK){
+		if(opt.tgt_blk_beg >=0 ){
+			blockBeg=opt.tgt_blk_beg;
+		} 
 		
-                if (read_buffer == NULL || write_buffer == NULL) {
-			log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
-		}
+		if(opt.tgt_blk_end>0 ) blockEnd=opt.tgt_blk_end;
+		else if(opt.tgt_blk_end==0 ) blockEnd=usedBlocks-1;
+	} 
 
-		/// read data from the first block
-		if (lseek(dfr, 0, SEEK_SET) == (off_t)-1)
-			log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
 
-		log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
+	log_mesg(0, 0, 1, debug, "%s, %i : md=%d, blockBeg=%lld blockEnd=%lld \n", __func__, __LINE__,
+		opt.src_mode,blockBeg,blockEnd);
 
-		/// start clone partition to image file
-		log_mesg(1, 0, 0, debug, "start backup data...\n");
 
-		blocks_in_cs = 0;
-		init_checksum(img_opt.checksum_mode, checksum, debug);
+	//@ADD.1
+	if(isSkipBlocks==0){
+		/**
+		 * start read and write data between source and destination
+		 */
+		if (opt.clone) {
 
-		if (opt.blockfile == 1) {
-			char torrent_name[PATH_MAX + 1] = {'\0'};
-			sprintf(torrent_name,"%s/torrent.info", target);
-			tinfo = fopen(torrent_name, "w");
+			const unsigned long long blocks_total = fs_info.totalblock;
+			const unsigned int block_size = fs_info.block_size;
+			const unsigned int buffer_capacity = opt.buffer_size > block_size ? opt.buffer_size / block_size : 1; // in blocks
+			unsigned char checksum[cs_size];
+			unsigned int blocks_in_cs, blocks_per_cs, write_size;
+			char *read_buffer = NULL, *write_buffer = NULL;
 
-			torrent_init(&torrent, tinfo);
-			fprintf(tinfo, "block_size: %u\n", block_size);
-			fprintf(tinfo, "blocks_total: %llu\n", blocks_total);
-		}
+			// SHA1 for torrent info
+			FILE* tinfo = NULL;
+			torrent_generator torrent;
 
-		block_id = 0;
-		do {
-			/// scan bitmap
-			unsigned long long i, blocks_skip, blocks_read;
-			unsigned int cs_added = 0, write_offset = 0;
-			off_t offset;
+			blocks_per_cs = img_opt.blocks_per_checksum;
 
-			/// skip unused blocks
-			for (blocks_skip = 0;
-			     block_id + blocks_skip < blocks_total &&
-			     !pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
-			     blocks_skip++);
-			if (block_id + blocks_skip == blocks_total)
-				break;
+			log_mesg(1, 0, 0, debug, "#\nBuffer capacity = %u, Blocks per cs = %u\n#\n", buffer_capacity, blocks_per_cs);
 
-			if (blocks_skip)
-				block_id += blocks_skip;
+			write_size = cnv_blocks_to_bytes(0, buffer_capacity, block_size, &img_opt);
 
-			/// read blocks
-			for (blocks_read = 0;
-			     block_id + blocks_read < blocks_total && blocks_read < buffer_capacity &&
-			     pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
-			     ++blocks_read);
-			if (!blocks_read)
-				break;
-
-			offset = (off_t)(block_id * block_size);
-			if (lseek(dfr, offset, SEEK_SET) == (off_t)-1)
-				log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
-
-			r_size = read_all(&dfr, read_buffer, blocks_read * block_size, &opt);
-			if (r_size != (int)(blocks_read * block_size)) {
-				if ((r_size == -1) && (errno == EIO)) {
-					if (opt.rescue) {
-						memset(read_buffer, 0, blocks_read * block_size);
-						for (r_size = 0; r_size < blocks_read * block_size; r_size += PART_SECTOR_SIZE)
-							rescue_sector(&dfr, offset + r_size, read_buffer + r_size, &opt);
-					} else
-						log_mesg(0, 1, 1, debug, "%s", bad_sectors_warning_msg);
-				} else
-					log_mesg(0, 1, 1, debug, "read error: %s\n", strerror(errno));
+					if (opt.read_direct_io == 1){
+						ret = posix_memalign((void **)&read_buffer, BSIZE, (buffer_capacity * block_size));
+						if ( ret < 0 ){
+							log_mesg(0, 1, 1, debug, "%s, %i, memory for read posix_memalign error\n", __func__, __LINE__);
+						}
+						memset(read_buffer, 0, (buffer_capacity * block_size));
+					} else {
+						read_buffer = (char*)malloc(buffer_capacity * block_size);
+					}
+					
+					write_buffer = (char*)malloc(write_size + cs_size);
+			
+			if (read_buffer == NULL || write_buffer == NULL) {
+				log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
 			}
 
-			log_mesg(2, 0, 0, debug, "blocks_read = %i\n", blocks_read);
+			/// read data from the first block
+			if (lseek(dfr, 0, SEEK_SET) == (off_t)-1)
+				log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
 
-			/// calculate checksum
+
+			//@ADD
+			if(opt.src_mode==RZ_BLOCK){
+					
+					unsigned long long block_idx0=blockBeg;
+					unsigned long long block_idx1=blockEnd;
+					
+					unsigned long long block_idxs[2]={blockBeg,blockEnd};
+					unsigned long long block_ids[2]={0,0};
+					to_block_id_from_used_block_idx(block_idxs,block_ids,fs_info,bitmap,&opt);
+
+					blockBeg=block_ids[0];
+					blockEnd=block_ids[1];
+
+					unsigned long long off=blockBeg*block_size;
+					if (lseek(dfr, off, SEEK_SET) == (off_t)-1)
+						log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
+
+					log_mesg(0, 0, 1, debug, "SEEK : ix0=%lld, ix1=%lld,begId=%lld,endId=%lld\n",
+							block_idx0,block_idx1,blockBeg,blockEnd);
+							
+			}
+
+
+			log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
+
+			/// start clone partition to image file
+			log_mesg(1, 0, 0, debug, "start backup data...\n");
+
+			blocks_in_cs = 0;
+			init_checksum(img_opt.checksum_mode, checksum, debug);
+
+			if (opt.blockfile == 1) {
+				char torrent_name[PATH_MAX + 1] = {'\0'};
+				sprintf(torrent_name,"%s/torrent.info", target);
+				tinfo = fopen(torrent_name, "w");
+
+				torrent_init(&torrent, tinfo);
+				fprintf(tinfo, "block_size: %u\n", block_size);
+				fprintf(tinfo, "blocks_total: %llu\n", blocks_total);
+			}
+
+			block_id = 0;
+			if(opt.src_mode==RZ_BLOCK){
+					block_id=blockBeg;
+			}
+
+			do {
+				/// scan bitmap
+				unsigned long long i, blocks_skip, blocks_read;
+				unsigned int cs_added = 0, write_offset = 0;
+				off_t offset;
+
+				/// skip unused blocks
+				for (blocks_skip = 0;
+					block_id + blocks_skip < blocks_total &&
+					!pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
+					blocks_skip++);
+				if (block_id + blocks_skip == blocks_total)
+					break;
+
+				if (blocks_skip)
+					block_id += blocks_skip;
+
+				/// read blocks
+				for (blocks_read = 0;
+					block_id + blocks_read < blocks_total && blocks_read < buffer_capacity &&
+					pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
+					++blocks_read);
+				if (!blocks_read)
+					break;
+
+
+				//@ADD  
+				if(opt.src_mode==RZ_BLOCK){
+					//if small, skip blocks
+					if(block_id<blockBeg && block_id+blocks_read<blockBeg){ 
+						block_id+=blocks_read;
+						continue;
+					}
+
+					//if block_id is small, seek to the begin block
+					if(block_id<blockBeg){
+						
+						blocks_read = blockBeg-block_id;
+						block_id=blockBeg;
+					}
+
+					//trim the block range
+					if(block_id+blocks_read>blockEnd){
+						blocks_read=blockEnd-block_id+1;
+					}
+
+					if(block_id>blockEnd){
+						break;
+					}
+				}				
+
+
+
+				offset = (off_t)(block_id * block_size);
+				if (lseek(dfr, offset, SEEK_SET) == (off_t)-1)
+					log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
+
+				r_size = read_all(&dfr, read_buffer, blocks_read * block_size, &opt);
+				if (r_size != (int)(blocks_read * block_size)) {
+					if ((r_size == -1) && (errno == EIO)) {
+						if (opt.rescue) {
+							memset(read_buffer, 0, blocks_read * block_size);
+							for (r_size = 0; r_size < blocks_read * block_size; r_size += PART_SECTOR_SIZE)
+								rescue_sector(&dfr, offset + r_size, read_buffer + r_size, &opt);
+						} else
+							log_mesg(0, 1, 1, debug, "%s", bad_sectors_warning_msg);
+					} else
+						log_mesg(0, 1, 1, debug, "read error: %s\n", strerror(errno));
+				}
+
+				log_mesg(2, 0, 0, debug, "blocks_read = %i\n", blocks_read);
+
+				/// calculate checksum
+				if (opt.blockfile == 0) {
+					for (i = 0; i < blocks_read; ++i) {
+
+						memcpy(write_buffer + write_offset,
+							read_buffer + i * block_size, block_size);
+
+						write_offset += block_size;
+
+						update_checksum(checksum, read_buffer + i * block_size, block_size);
+
+						if (blocks_per_cs > 0 && ++blocks_in_cs == blocks_per_cs) {
+							log_mesg(3, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
+
+							memcpy(write_buffer + write_offset, checksum, cs_size);
+
+							++cs_added;
+							write_offset += cs_size;
+
+							blocks_in_cs = 0;
+							if (cs_reseed)
+								init_checksum(img_opt.checksum_mode, checksum, debug);
+						}
+					}
+				}
+
+				/// write buffer to target
+				if (opt.blockfile == 1) {
+					// SHA1 for torrent info
+					// Not always bigger or smaller than 16MB
+
+					// first we write out block_id * block_size for filename
+					// because when calling write_block_file
+					// we will create a new file to describe a continuous block (or buffer is full)
+					// and never write to same file again
+					torrent_start_offset(&torrent, block_id * block_size);
+					torrent_end_length(&torrent, blocks_read * block_size);
+
+					torrent_update(&torrent, read_buffer, blocks_read * block_size);
+
+					if (opt.torrent_only == 1) {
+						w_size = blocks_read * block_size;
+					} else {
+						w_size = write_block_file(target, read_buffer, blocks_read * block_size, block_id * block_size, &opt);
+					}
+				} else {
+					w_size = write_all(&dfw, write_buffer, write_offset, &opt);
+					if (w_size != write_offset)
+						log_mesg(0, 1, 1, debug, "image write ERROR:%s\n", strerror(errno));
+				}
+
+				/// count copied block
+				copied += blocks_read;
+				log_mesg(2, 0, 0, debug, "copied = %lld\n", copied);
+
+				//@ADD
+				if(RZDBG) log_mesg(0, 0, 1, debug, "DBG : seek - blk=%lld,rdCnt=%i,totBlk=%llu,blkSz=%d,md=%d,beg=%lld,end=%lld\n",
+						block_id,blocks_read,copied,block_size,opt.src_mode,blockBeg,blockEnd);
+
+				/// next block
+				block_id += blocks_read;
+
+				/// read or write error
+				if (r_size + cs_added * cs_size != w_size)
+					log_mesg(0, 1, 1, debug, "read(%i) and write(%i) different\n", r_size, w_size);
+
+			} while (1);
+
+			if (opt.blockfile == 1) {
+				torrent_final(&torrent);
+			} else {
+
+				int isSkip=opt.src_mode==RZ_BLOCK;
+				//if (blocks_in_cs > 0 && isSkip==0) {
+				if (blocks_in_cs > 0 ) {	
+
+					// Write the checksum for the latest blocks
+					log_mesg(1, 0, 0, debug, "Write the checksum for the latest blocks. size = %i\n", cs_size);
+					log_mesg(3, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
+					w_size = write_all(&dfw, (char*)checksum, cs_size, &opt);
+					if (w_size != cs_size)
+						log_mesg(0, 1, 1, debug, "image write ERROR:%s\n", strerror(errno));
+				}
+			}
+
+			free(write_buffer);
+			free(read_buffer);
+
+		// check only the size when the image does not contains checksums and does not
+		// comes from a pipe
+		} else if (opt.chkimg && img_opt.checksum_mode == CSM_NONE
+			&& strcmp(opt.source, "-") != 0) {
+
+			unsigned long long total_offset = (fs_info.usedblocks - 1) * fs_info.block_size;
+			char last_block[fs_info.block_size];
+			off_t partial_offset = INT32_MAX;
+
+			while (total_offset) {
+
+				if (partial_offset > total_offset)
+					partial_offset = total_offset;
+
+				if (lseek(dfr, partial_offset, SEEK_CUR) == (off_t)-1)
+					log_mesg(0, 1, 1, debug, "source seek ERROR: %s\n", strerror(errno));
+
+				total_offset -= partial_offset;
+			}
+
+			if (read_all(&dfr, last_block, fs_info.block_size, &opt) != fs_info.block_size)
+				log_mesg(0, 1, 1, debug, "ERROR: source image too short\n");
+
+		} else if (opt.restore) {
+
+			const unsigned long long blocks_total = fs_info.totalblock;
+			const unsigned int block_size = fs_info.block_size;
+			const unsigned int buffer_capacity = opt.buffer_size > block_size ? opt.buffer_size / block_size : 1; // in blocks
+			const unsigned int blocks_per_cs = img_opt.blocks_per_checksum;
+			unsigned long long blocks_used = fs_info.usedblocks;
+			unsigned int blocks_in_cs, buffer_size, read_offset;
+			unsigned char checksum[cs_size];
+			char *read_buffer = NULL, *write_buffer = NULL;
+			char *empty_buffer = NULL;
+			unsigned long long blocks_used_fix = 0, test_block = 0;
+
+			// SHA1 for torrent info
+			FILE *tinfo = NULL;
+			torrent_generator torrent;
+
+			//@ADD
+			unsigned long long blkRdCnt=0;
+	 
+			log_mesg(1, 0, 0, debug, "#\nBuffer capacity = %u, Blocks per cs = %u\n#\n", buffer_capacity, blocks_per_cs);
+
+			// fix some super block record incorrect
+			for (test_block = 0; test_block < blocks_total; ++test_block)
+				if (pc_test_bit(test_block, bitmap, fs_info.totalblock))
+					blocks_used_fix++;
+
+			if (blocks_used_fix != blocks_used) {
+				blocks_used = blocks_used_fix;
+				log_mesg(1, 0, 0, debug, "info: fixed used blocks count\n");
+			}
+			buffer_size = cnv_blocks_to_bytes(0, buffer_capacity, block_size, &img_opt);
+
+			if (img_opt.image_version != 0x0001)
+				read_buffer = (char*)malloc(buffer_size);
+			else {
+				// Allocate more memory in case the image is affected by the 64 bits bug
+				read_buffer = (char*)malloc(buffer_size + buffer_capacity * cs_size);
+			}
+			//write_buffer = (char*)malloc(buffer_capacity * block_size);
+			posix_memalign((void**)&write_buffer, BSIZE, buffer_capacity * block_size);
+			if (read_buffer == NULL || write_buffer == NULL) {
+				log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
+			}
+
+			if (target_stdout) {
+				empty_buffer = malloc(block_size);
+				if (empty_buffer == NULL) {
+					log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
+				}
+				memset(empty_buffer, 0, block_size);
+			}
+
+	#ifndef CHKIMG
+			/// seek to the first
 			if (opt.blockfile == 0) {
+				if (skip_bytes(&dfw, empty_buffer, block_size, opt.offset, &opt) != opt.offset){
+				log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+				}
+			}
+	#endif
+
+			/// start restore image file to partition
+			log_mesg(1, 0, 0, debug, "start restore data...\n");
+
+			//@ADD
+			if(opt.tgt_mode==RZ_BLOCK){
+				opt.ignore_crc=1;
+			}
+
+			blocks_in_cs = 0;
+			if (!opt.ignore_crc)
+				init_checksum(img_opt.checksum_mode, checksum, debug);
+
+			// init SHA1 for torrent info
+			if (opt.blockfile == 1) {
+				char torrent_name[PATH_MAX + 1] = {'\0'};
+				sprintf(torrent_name,"%s/torrent.info", target);
+				tinfo = fopen(torrent_name, "w");
+
+				torrent_init(&torrent, tinfo);
+				fprintf(tinfo, "block_size: %u\n", block_size);
+				fprintf(tinfo, "blocks_total: %llu\n", blocks_total);
+			}
+
+			block_id = 0;
+
+			
+			//@ADD
+			if(opt.tgt_mode==RZ_BLOCK){
+				// img_opt.blocks_per_checksum=0;
+
+				if(blockBeg>=0) {
+					unsigned long long block_idxs[2]={blockBeg,blockEnd};
+					unsigned long long block_ids[2]={0,0};
+					to_block_id_from_used_block_idx(block_idxs,block_ids,fs_info,bitmap,&opt);
+
+					block_beg_id=block_ids[0];
+					//block_end_id=block_ids[1];
+					block_end_id=blockEnd;
+
+					block_id=block_beg_id;
+					if(blockBeg>=0) copied=blockBeg;
+				}
+
+				off_t toff=block_id*block_size;
+				if(RZDBG) log_mesg(0, 0, 1, debug, "target seek :blkId=%lld, off=%lld ,begId=%lld,endId=%lld ,copied=%lld \n",
+							block_id, toff,blockBeg,blockEnd,copied);
+
+				if (lseek(dfw, toff, SEEK_SET) == (off_t)-1)
+						log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+			}
+			
+
+				unsigned long long total_write=0;
+			do {
+				unsigned int i;
+				unsigned long long blocks_written, blocks_skip;
+				unsigned int read_size;
+				// max chunk to read using one read(2) syscall
+				unsigned int blocks_read = 0;
+				if(opt.tgt_mode==RZ_BLOCK){
+					//img_opt.blocks_per_checksum=0;
+					 
+					blocks_read = copied + buffer_capacity < (blockEnd+1) ?
+						buffer_capacity : (blockEnd+1) - copied;
+
+					// blocks_read = copied + buffer_capacity < (block_end_id+1) ?
+					// 	buffer_capacity : (block_end_id+1) - copied;
+
+						if(RZDBG&&1)log_mesg(0, 0, 1, debug, "blocks_read.0 = %d and copied = %lld >>>>>\n", blocks_read, copied);
+				}else {
+					//FOR DEBUG
+					 //img_opt.blocks_per_checksum=0; // if no comment ,  fail
+					 //img_opt.checksum_mode=CSM_NONE;// if no comment ,  fail
+
+					// opt.ignore_crc=1;  // if no comment ,  ok
+
+					//@ORG					
+					blocks_read = copied + buffer_capacity < blocks_used ?
+						buffer_capacity : blocks_used - copied;	
+					
+					if(RZDBG&&1)log_mesg(0, 0, 1, debug, "blocks_read.0 = %d and copied = %lld >>>>>\n", blocks_read, copied);						
+				}
+
+				if (!blocks_read)
+					break;
+				if (blocks_read < 0)
+					log_mesg(0, 1, 1, debug, "blocks_read ERROR: impossible size of blocks_read\n");
+			
+
+				if(RZDBG&&1)log_mesg(0, 0, 1, debug, "blocks_read = %d and copied = %lld , blocks_per_checksum=%d>>>>>\n", blocks_read, copied,img_opt.blocks_per_checksum);
+
+				read_size = cnv_blocks_to_bytes(copied, blocks_read, block_size, &img_opt);
+ 
+				// increase read_size to make room for the oversized checksum
+				if (opt.tgt_mode!=RZ_BLOCK&&blocks_per_cs && blocks_read < buffer_capacity &&
+						(blocks_read % blocks_per_cs) && (blocks_used % blocks_per_cs)) {
+					/// it is the last read and there is a partial chunk at the end
+					log_mesg(1, 0, 0, debug, "# PARTIAL CHUNK\n");
+					read_size += cs_size;
+				}
+
+
+				// read chunk from image
+				if(RZDBG) log_mesg(0, 0, 1, debug, "read more: rdSz=%d, chkOn=%d\n",read_size,img_opt.blocks_per_checksum);
+				
+				r_size = read_all(&dfr, read_buffer, read_size, &opt);
+				if (r_size != read_size)
+					log_mesg(0, 1, 1, debug, "restore.read_all > read ERROR:%s\n", strerror(errno));
+
+				// read buffer is the follows:
+				// <blocks_per_cs><cs1><blocks_per_cs><cs2>...
+
+				// write buffer should be the following:
+				// <block1><block2>...
+
+				read_offset = 0;
 				for (i = 0; i < blocks_read; ++i) {
 
-					memcpy(write_buffer + write_offset,
-						read_buffer + i * block_size, block_size);
+					memcpy(write_buffer + i * block_size,
+						read_buffer + read_offset, block_size);
 
-					write_offset += block_size;
+					if (opt.ignore_crc) {
+						read_offset += block_size;
+						if (++blocks_in_cs == blocks_per_cs){
+							read_offset += cs_size;
+													blocks_in_cs = 0;
+												}
+						continue;
+					}
 
-					update_checksum(checksum, read_buffer + i * block_size, block_size);
+					update_checksum(checksum, read_buffer + read_offset, block_size);
 
-					if (blocks_per_cs > 0 && ++blocks_in_cs == blocks_per_cs) {
-					    log_mesg(3, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
+					if (++blocks_in_cs == blocks_per_cs) {
 
-						memcpy(write_buffer + write_offset, checksum, cs_size);
+						unsigned char checksum_orig[cs_size];
+						memcpy(checksum_orig, read_buffer + read_offset + block_size, cs_size);
+						log_mesg(3, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
+						log_mesg(3, 0, 0, debug, "CRC.orig = %x%x%x%x \n", checksum_orig[0], checksum_orig[1], checksum_orig[2], checksum_orig[3]);
+						if (memcmp(read_buffer + read_offset + block_size, checksum, cs_size)) {
+							log_mesg(0, 1, 1, debug, "CRC error, block_id=%llu...\n ", block_id + i);
+						}
 
-						++cs_added;
-						write_offset += cs_size;
+						read_offset += cs_size;
 
 						blocks_in_cs = 0;
 						if (cs_reseed)
 							init_checksum(img_opt.checksum_mode, checksum, debug);
 					}
-				}
-			}
 
-			/// write buffer to target
-			if (opt.blockfile == 1) {
-				// SHA1 for torrent info
-				// Not always bigger or smaller than 16MB
-
-				// first we write out block_id * block_size for filename
-				// because when calling write_block_file
-				// we will create a new file to describe a continuous block (or buffer is full)
-				// and never write to same file again
-				torrent_start_offset(&torrent, block_id * block_size);
-				torrent_end_length(&torrent, blocks_read * block_size);
-
-				torrent_update(&torrent, read_buffer, blocks_read * block_size);
-
-				if (opt.torrent_only == 1) {
-					w_size = blocks_read * block_size;
-				} else {
-					w_size = write_block_file(target, read_buffer, blocks_read * block_size, block_id * block_size, &opt);
-				}
-			} else {
-				w_size = write_all(&dfw, write_buffer, write_offset, &opt);
-				if (w_size != write_offset)
-					log_mesg(0, 1, 1, debug, "image write ERROR:%s\n", strerror(errno));
-			}
-
-			/// count copied block
-			copied += blocks_read;
-			log_mesg(2, 0, 0, debug, "copied = %lld\n", copied);
-
-			/// next block
-			block_id += blocks_read;
-
-			/// read or write error
-			if (r_size + cs_added * cs_size != w_size)
-				log_mesg(0, 1, 1, debug, "read(%i) and write(%i) different\n", r_size, w_size);
-
-		} while (1);
-
-		if (opt.blockfile == 1) {
-			torrent_final(&torrent);
-		} else {
-			if (blocks_in_cs > 0) {
-
-				// Write the checksum for the latest blocks
-				log_mesg(1, 0, 0, debug, "Write the checksum for the latest blocks. size = %i\n", cs_size);
-				log_mesg(3, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
-				w_size = write_all(&dfw, (char*)checksum, cs_size, &opt);
-				if (w_size != cs_size)
-					log_mesg(0, 1, 1, debug, "image write ERROR:%s\n", strerror(errno));
-			}
-		}
-
-		free(write_buffer);
-		free(read_buffer);
-
-	// check only the size when the image does not contains checksums and does not
-	// comes from a pipe
-	} else if (opt.chkimg && img_opt.checksum_mode == CSM_NONE
-		&& strcmp(opt.source, "-") != 0) {
-
-		unsigned long long total_offset = (fs_info.usedblocks - 1) * fs_info.block_size;
-		char last_block[fs_info.block_size];
-		off_t partial_offset = INT32_MAX;
-
-		while (total_offset) {
-
-			if (partial_offset > total_offset)
-				partial_offset = total_offset;
-
-			if (lseek(dfr, partial_offset, SEEK_CUR) == (off_t)-1)
-				log_mesg(0, 1, 1, debug, "source seek ERROR: %s\n", strerror(errno));
-
-			total_offset -= partial_offset;
-		}
-
-		if (read_all(&dfr, last_block, fs_info.block_size, &opt) != fs_info.block_size)
-			log_mesg(0, 1, 1, debug, "ERROR: source image too short\n");
-
-	} else if (opt.restore) {
-
-		const unsigned long long blocks_total = fs_info.totalblock;
-		const unsigned int block_size = fs_info.block_size;
-		const unsigned int buffer_capacity = opt.buffer_size > block_size ? opt.buffer_size / block_size : 1; // in blocks
-		const unsigned int blocks_per_cs = img_opt.blocks_per_checksum;
-		unsigned long long blocks_used = fs_info.usedblocks;
-		unsigned int blocks_in_cs, buffer_size, read_offset;
-		unsigned char checksum[cs_size];
-		char *read_buffer = NULL, *write_buffer = NULL;
-		char *empty_buffer = NULL;
-		unsigned long long blocks_used_fix = 0, test_block = 0;
-
-		// SHA1 for torrent info
-		FILE *tinfo = NULL;
-		torrent_generator torrent;
-
-		log_mesg(1, 0, 0, debug, "#\nBuffer capacity = %u, Blocks per cs = %u\n#\n", buffer_capacity, blocks_per_cs);
-
-		// fix some super block record incorrect
-		for (test_block = 0; test_block < blocks_total; ++test_block)
-			if (pc_test_bit(test_block, bitmap, fs_info.totalblock))
-				blocks_used_fix++;
-
-		if (blocks_used_fix != blocks_used) {
-			blocks_used = blocks_used_fix;
-			log_mesg(1, 0, 0, debug, "info: fixed used blocks count\n");
-		}
-		buffer_size = cnv_blocks_to_bytes(0, buffer_capacity, block_size, &img_opt);
-
-		if (img_opt.image_version != 0x0001)
-			read_buffer = (char*)malloc(buffer_size);
-		else {
-			// Allocate more memory in case the image is affected by the 64 bits bug
-			read_buffer = (char*)malloc(buffer_size + buffer_capacity * cs_size);
-		}
-		//write_buffer = (char*)malloc(buffer_capacity * block_size);
-		posix_memalign((void**)&write_buffer, BSIZE, buffer_capacity * block_size);
-		if (read_buffer == NULL || write_buffer == NULL) {
-			log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
-		}
-
-		if (target_stdout) {
-			empty_buffer = malloc(block_size);
-			if (empty_buffer == NULL) {
-				log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
-			}
-			memset(empty_buffer, 0, block_size);
-		}
-
-#ifndef CHKIMG
-		/// seek to the first
-		if (opt.blockfile == 0) {
-		    if (skip_bytes(&dfw, empty_buffer, block_size, opt.offset, &opt) != opt.offset){
-			log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
-		    }
-		}
-#endif
-
-		/// start restore image file to partition
-		log_mesg(1, 0, 0, debug, "start restore data...\n");
-
-		blocks_in_cs = 0;
-		if (!opt.ignore_crc)
-			init_checksum(img_opt.checksum_mode, checksum, debug);
-
-		// init SHA1 for torrent info
-		if (opt.blockfile == 1) {
-			char torrent_name[PATH_MAX + 1] = {'\0'};
-			sprintf(torrent_name,"%s/torrent.info", target);
-			tinfo = fopen(torrent_name, "w");
-
-			torrent_init(&torrent, tinfo);
-			fprintf(tinfo, "block_size: %u\n", block_size);
-			fprintf(tinfo, "blocks_total: %llu\n", blocks_total);
-		}
-
-		block_id = 0;
-		do {
-			unsigned int i;
-			unsigned long long blocks_written, blocks_skip;
-			unsigned int read_size;
-			// max chunk to read using one read(2) syscall
-			unsigned int blocks_read = copied + buffer_capacity < blocks_used ?
-				buffer_capacity : blocks_used - copied;
-			if (!blocks_read)
-			    break;
-			if (blocks_read < 0)
-			    log_mesg(0, 1, 1, debug, "blocks_read ERROR: impossible size of blocks_read\n");
-
-			log_mesg(1, 0, 0, debug, "blocks_read = %d and copied = %lld\n", blocks_read, copied);
-			read_size = cnv_blocks_to_bytes(copied, blocks_read, block_size, &img_opt);
-
-			// increase read_size to make room for the oversized checksum
-			if (blocks_per_cs && blocks_read < buffer_capacity &&
-					(blocks_read % blocks_per_cs) && (blocks_used % blocks_per_cs)) {
-				/// it is the last read and there is a partial chunk at the end
-				log_mesg(1, 0, 0, debug, "# PARTIAL CHUNK\n");
-				read_size += cs_size;
-			}
-
-			// read chunk from image
-			log_mesg(1, 0, 0, debug, "read more: ");
-
-			r_size = read_all(&dfr, read_buffer, read_size, &opt);
-			if (r_size != read_size)
-				log_mesg(0, 1, 1, debug, "read ERROR:%s\n", strerror(errno));
-
-			// read buffer is the follows:
-			// <blocks_per_cs><cs1><blocks_per_cs><cs2>...
-
-			// write buffer should be the following:
-			// <block1><block2>...
-
-			read_offset = 0;
-			for (i = 0; i < blocks_read; ++i) {
-
-				memcpy(write_buffer + i * block_size,
-					read_buffer + read_offset, block_size);
-
-				if (opt.ignore_crc) {
 					read_offset += block_size;
-					if (++blocks_in_cs == blocks_per_cs){
-						read_offset += cs_size;
-                                                blocks_in_cs = 0;
-                                            }
-					continue;
 				}
+				if (!opt.ignore_crc && blocks_in_cs && blocks_per_cs && blocks_read < buffer_capacity &&
+						(blocks_read % blocks_per_cs)) {
 
-				update_checksum(checksum, read_buffer + read_offset, block_size);
-
-				if (++blocks_in_cs == blocks_per_cs) {
-
-				    unsigned char checksum_orig[cs_size];
-				    memcpy(checksum_orig, read_buffer + read_offset + block_size, cs_size);
-				    log_mesg(3, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
-				    log_mesg(3, 0, 0, debug, "CRC.orig = %x%x%x%x \n", checksum_orig[0], checksum_orig[1], checksum_orig[2], checksum_orig[3]);
-					if (memcmp(read_buffer + read_offset + block_size, checksum, cs_size)) {
-					    log_mesg(0, 1, 1, debug, "CRC error, block_id=%llu...\n ", block_id + i);
+					log_mesg(1, 0, 0, debug, "check latest chunk's checksum covering %u blocks\n", blocks_in_cs);
+					if (memcmp(read_buffer + read_offset, checksum, cs_size)){
+					unsigned char checksum_orig[cs_size];
+					memcpy(checksum_orig, read_buffer + read_offset, cs_size);
+					log_mesg(1, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
+					log_mesg(1, 0, 0, debug, "CRC.orig = %x%x%x%x \n", checksum_orig[0], checksum_orig[1], checksum_orig[2], checksum_orig[3]);
+					log_mesg(0, 1, 1, debug, "CRC error, block_id=%llu...\n ", block_id + i);
 					}
 
-					read_offset += cs_size;
-
-					blocks_in_cs = 0;
-					if (cs_reseed)
-						init_checksum(img_opt.checksum_mode, checksum, debug);
 				}
 
-				read_offset += block_size;
+
+				blocks_written = 0;
+				do {
+					unsigned int blocks_write = 0;
+
+					/// count bytes to skip
+					for (blocks_skip = 0;
+						block_id + blocks_skip < blocks_total &&
+						!pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
+						blocks_skip++);
+
+	#ifndef CHKIMG
+					/// skip empty blocks
+					if (blocks_write == 0) {
+						if (opt.blockfile == 0 && blocks_skip > 0 && skip_blocks(&dfw, empty_buffer, block_size, blocks_skip, &opt, &block_id) < 0) {
+						log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+						} else if (opt.blockfile == 1 && blocks_skip > 0) 
+											block_id += blocks_skip; 
+										blocks_skip = 0;
+					}
+	#endif
+					if (blocks_skip > 0)
+						block_id += blocks_skip;
+
+					
+
+					/// blocks to write
+					for (blocks_write = 0;
+						block_id + blocks_write < blocks_total &&
+						blocks_written + blocks_write < blocks_read &&
+						pc_test_bit(block_id + blocks_write, bitmap, fs_info.totalblock);
+						blocks_write++);
+
+	#ifndef CHKIMG
+					// write blocks
+					if (blocks_write > 0) {
+							if (opt.blockfile == 1){
+							// SHA1 for torrent info
+							// Not always bigger or smaller than 16MB
+							
+							// first we write out block_id * block_size for filename
+							// because when calling write_block_file
+							// we will create a new file to describe a continuous block (or buffer is full)
+							// and never write to same file again
+							torrent_start_offset(&torrent, block_id * block_size);
+							torrent_end_length(&torrent, blocks_write * block_size);
+
+							torrent_update(&torrent, write_buffer + blocks_written * block_size, blocks_write * block_size);
+
+							if (opt.torrent_only == 1) {
+							w_size = blocks_write * block_size;
+							} else {
+								w_size = write_block_file(target, write_buffer + blocks_written * block_size,
+								blocks_write * block_size, (block_id*block_size), &opt);
+							}
+						}else{
+							total_write+=blocks_write;
+
+							//@ADD
+							if(RZDBG) log_mesg(0, 0, 1, debug, "target write :blkId=%lld, begId=%lld,endId=%lld, total_blk=%lld , skip=%lld, wrtCnt=%lld, total_wrt=%lld \n",
+									block_id, block_beg_id,block_end_id,blocks_total,blocks_skip,blocks_write,total_write);
+
+							w_size = write_all(&dfw, write_buffer + blocks_written * block_size,
+								blocks_write * block_size, &opt);
+						}
+						if (w_size != blocks_write * block_size) {
+							if (!opt.skip_write_error)
+								log_mesg(0, 1, 1, debug, "write block %llu ERROR:%s\n", block_id + blocks_written, strerror(errno));
+							else
+								log_mesg(0, 0, 1, debug, "skip write block %llu error:%s\n", block_id + blocks_written, strerror(errno));
+						}
+					}
+	#endif
+
+					blocks_written += blocks_write;
+					block_id += blocks_write;
+					copied += blocks_write;
+				} while (blocks_written < blocks_read);
+
+
+				//@ADD
+				// if(opt.tgt_mode==RZ_BLOCK){
+				// 	if(block_id >= block_end_id){
+				// 		break;
+				// 	}
+				// }
+			} while(1);
+
+			// finish SHA1 for torrent info
+			if (opt.blockfile == 1) {
+				torrent_final(&torrent);
 			}
-			if (!opt.ignore_crc && blocks_in_cs && blocks_per_cs && blocks_read < buffer_capacity &&
-					(blocks_read % blocks_per_cs)) {
 
-			    log_mesg(1, 0, 0, debug, "check latest chunk's checksum covering %u blocks\n", blocks_in_cs);
-			    if (memcmp(read_buffer + read_offset, checksum, cs_size)){
-				unsigned char checksum_orig[cs_size];
-				memcpy(checksum_orig, read_buffer + read_offset, cs_size);
-				log_mesg(1, 0, 0, debug, "CRC = %x%x%x%x \n", checksum[0], checksum[1], checksum[2], checksum[3]);
-				log_mesg(1, 0, 0, debug, "CRC.orig = %x%x%x%x \n", checksum_orig[0], checksum_orig[1], checksum_orig[2], checksum_orig[3]);
-				log_mesg(0, 1, 1, debug, "CRC error, block_id=%llu...\n ", block_id + i);
-			    }
-
+			free(write_buffer);
+			free(read_buffer);
+			if (empty_buffer) {
+				if (block_id < blocks_total && skip_blocks(&dfw, empty_buffer, block_size, blocks_total - block_id, &opt, &block_id) < 0) {
+				log_mesg(0, 0, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+				}
+				if (block_id * block_size < fs_info.device_size && skip_bytes(&dfw, empty_buffer, block_size, fs_info.device_size - block_id * block_size, &opt) != fs_info.device_size - block_id * block_size) {
+				log_mesg(0, 0, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+				}
+				free(empty_buffer);
 			}
 
-
-			blocks_written = 0;
-			do {
-				unsigned int blocks_write = 0;
-
-				/// count bytes to skip
-				for (blocks_skip = 0;
-				     block_id + blocks_skip < blocks_total &&
-				     !pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
-				     blocks_skip++);
-
-#ifndef CHKIMG
-				/// skip empty blocks
-				if (blocks_write == 0) {
-				    if (opt.blockfile == 0 && blocks_skip > 0 && skip_blocks(&dfw, empty_buffer, block_size, blocks_skip, &opt, &block_id) < 0) {
-					log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
-				    } else if (opt.blockfile == 1 && blocks_skip > 0) 
-                                        block_id += blocks_skip; 
-                                    blocks_skip = 0;
+	#ifndef CHKIMG
+			/// restore_raw_file option
+			if (opt.restore_raw_file && !pc_test_bit(blocks_total - 1, bitmap, fs_info.totalblock)) {
+				if (ftruncate(dfw, (off_t)fs_info.device_size) == -1){
+				log_mesg(0, 0, 1, debug, "ftruncate ERROR:%s\n", strerror(errno));
 				}
-#endif
-				if (blocks_skip > 0)
-				    block_id += blocks_skip;
+				log_mesg(1, 0, 0, debug, "ftruncate:%llu\n", (off_t)fs_info.device_size);
+			}
+	#endif
 
-				/// blocks to write
-				for (blocks_write = 0;
-				     block_id + blocks_write < blocks_total &&
-				     blocks_written + blocks_write < blocks_read &&
-				     pc_test_bit(block_id + blocks_write, bitmap, fs_info.totalblock);
-				     blocks_write++);
+		} else if (opt.dd) {
 
-#ifndef CHKIMG
-				// write blocks
-				if (blocks_write > 0) {
-				        if (opt.blockfile == 1){
-					    // SHA1 for torrent info
-					    // Not always bigger or smaller than 16MB
-					    
-					    // first we write out block_id * block_size for filename
-					    // because when calling write_block_file
-					    // we will create a new file to describe a continuous block (or buffer is full)
-					    // and never write to same file again
-					    torrent_start_offset(&torrent, block_id * block_size);
-					    torrent_end_length(&torrent, blocks_write * block_size);
+			char *buffer = NULL;
+			char *empty_buffer = NULL;
+			int block_size = fs_info.block_size;
+			unsigned long long blocks_total = fs_info.totalblock;
+			int buffer_capacity = block_size < opt.buffer_size ? opt.buffer_size / block_size : 1;
 
-					    torrent_update(&torrent, write_buffer + blocks_written * block_size, blocks_write * block_size);
-
-					    if (opt.torrent_only == 1) {
-						w_size = blocks_write * block_size;
-					    } else {
-					    	w_size = write_block_file(target, write_buffer + blocks_written * block_size,
-							blocks_write * block_size, (block_id*block_size), &opt);
-					    }
-					}else{
-					    w_size = write_all(&dfw, write_buffer + blocks_written * block_size,
-						    blocks_write * block_size, &opt);
+					if ((opt.read_direct_io == 1) || (opt.write_direct_io == 1)){
+						ret = posix_memalign((void **)&buffer, BSIZE, (buffer_capacity * block_size));
+						if ( ret < 0 ){
+							log_mesg(0, 1, 1, debug, "%s, %i, memory for read posix_memalign error\n", __func__, __LINE__);
+						}
+						memset(buffer, 0, (buffer_capacity * block_size));
+					} else {
+						buffer = (char*)malloc(buffer_capacity * block_size);
 					}
-					if (w_size != blocks_write * block_size) {
-						if (!opt.skip_write_error)
-							log_mesg(0, 1, 1, debug, "write block %llu ERROR:%s\n", block_id + blocks_written, strerror(errno));
-						else
-							log_mesg(0, 0, 1, debug, "skip write block %llu error:%s\n", block_id + blocks_written, strerror(errno));
-					}
-				}
-#endif
 
-				blocks_written += blocks_write;
-				block_id += blocks_write;
-				copied += blocks_write;
-			} while (blocks_written < blocks_read);
-
-		} while(1);
-
-		// finish SHA1 for torrent info
-		if (opt.blockfile == 1) {
-			torrent_final(&torrent);
-		}
-
-		free(write_buffer);
-		free(read_buffer);
-		if (empty_buffer) {
-		    if (block_id < blocks_total && skip_blocks(&dfw, empty_buffer, block_size, blocks_total - block_id, &opt, &block_id) < 0) {
-			log_mesg(0, 0, 1, debug, "target seek ERROR:%s\n", strerror(errno));
-		    }
-		    if (block_id * block_size < fs_info.device_size && skip_bytes(&dfw, empty_buffer, block_size, fs_info.device_size - block_id * block_size, &opt) != fs_info.device_size - block_id * block_size) {
-			log_mesg(0, 0, 1, debug, "target seek ERROR:%s\n", strerror(errno));
-		    }
-		    free(empty_buffer);
-		}
-
-#ifndef CHKIMG
-		/// restore_raw_file option
-		if (opt.restore_raw_file && !pc_test_bit(blocks_total - 1, bitmap, fs_info.totalblock)) {
-		    if (ftruncate(dfw, (off_t)fs_info.device_size) == -1){
-			log_mesg(0, 0, 1, debug, "ftruncate ERROR:%s\n", strerror(errno));
-		    }
-		    log_mesg(1, 0, 0, debug, "ftruncate:%llu\n", (off_t)fs_info.device_size);
-		}
-#endif
-
-	} else if (opt.dd) {
-
-		char *buffer = NULL;
-		char *empty_buffer = NULL;
-		int block_size = fs_info.block_size;
-		unsigned long long blocks_total = fs_info.totalblock;
-		int buffer_capacity = block_size < opt.buffer_size ? opt.buffer_size / block_size : 1;
-
-                if ((opt.read_direct_io == 1) || (opt.write_direct_io == 1)){
-                    ret = posix_memalign((void **)&buffer, BSIZE, (buffer_capacity * block_size));
-                    if ( ret < 0 ){
-                        log_mesg(0, 1, 1, debug, "%s, %i, memory for read posix_memalign error\n", __func__, __LINE__);
-                    }
-                    memset(buffer, 0, (buffer_capacity * block_size));
-                } else {
-                    buffer = (char*)malloc(buffer_capacity * block_size);
-                }
-
-		if (buffer == NULL) {
-			log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
-		}
-
-		if (target_stdout) {
-			empty_buffer = malloc(block_size);
-			if (empty_buffer == NULL) {
+			if (buffer == NULL) {
 				log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
 			}
-			memset(empty_buffer, 0, block_size);
-		}
 
-		block_id = 0;
-
-		if (lseek(dfr, 0, SEEK_SET) == (off_t)-1)
-			log_mesg(0, 1, 1, debug, "source seek ERROR:%d\n", strerror(errno));
-		if (skip_bytes(&dfw, empty_buffer, block_size, opt.offset, &opt) != opt.offset) {
-			log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
-		}
-
-		log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
-
-		/// start clone partition to partition
-		log_mesg(1, 0, 0, debug, "start backup data device-to-device...\n");
-		do {
-			/// scan bitmap
-			unsigned long long blocks_skip, blocks_read;
-			off_t offset;
-
-			/// skip unused blocks
-			for (blocks_skip = 0;
-			     block_id + blocks_skip < blocks_total &&
-			     !pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
-			     blocks_skip++);
-
-			if (block_id + blocks_skip == blocks_total)
-				break;
-
-			if (blocks_skip) {
-				if (skip_blocks(&dfw, empty_buffer, block_size, blocks_skip, &opt, &block_id) < 0) {
-					log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+			if (target_stdout) {
+				empty_buffer = malloc(block_size);
+				if (empty_buffer == NULL) {
+					log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
 				}
+				memset(empty_buffer, 0, block_size);
 			}
 
-			/// read chunk from source
-			for (blocks_read = 0;
-			     block_id + blocks_read < blocks_total && blocks_read < buffer_capacity &&
-			     pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
-			     ++blocks_read);
+			block_id = 0;
 
-			if (!blocks_read)
-				break;
+			if (lseek(dfr, 0, SEEK_SET) == (off_t)-1)
+				log_mesg(0, 1, 1, debug, "source seek ERROR:%d\n", strerror(errno));
+			if (skip_bytes(&dfw, empty_buffer, block_size, opt.offset, &opt) != opt.offset) {
+				log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+			}
 
-			offset = (off_t)(block_id * block_size);
-			if (lseek(dfr, offset, SEEK_SET) == (off_t)-1)
-				log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
+			log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
 
-			r_size = read_all(&dfr, buffer, blocks_read * block_size, &opt);
-			if (r_size != (int)(blocks_read * block_size)) {
-				if ((r_size == -1) && (errno == EIO)) {
-					if (opt.rescue) {
-						memset(buffer, 0, blocks_read * block_size);
-						for (r_size = 0; r_size < blocks_read * block_size; r_size += PART_SECTOR_SIZE)
-							rescue_sector(&dfr, offset + r_size, buffer + r_size, &opt);
+			/// start clone partition to partition
+			log_mesg(1, 0, 0, debug, "start backup data device-to-device...\n");
+			do {
+				/// scan bitmap
+				unsigned long long blocks_skip, blocks_read;
+				off_t offset;
+
+				/// skip unused blocks
+				for (blocks_skip = 0;
+					block_id + blocks_skip < blocks_total &&
+					!pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
+					blocks_skip++);
+
+				if (block_id + blocks_skip == blocks_total)
+					break;
+
+				if (blocks_skip) {
+					if (skip_blocks(&dfw, empty_buffer, block_size, blocks_skip, &opt, &block_id) < 0) {
+						log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
+					}
+				}
+
+				/// read chunk from source
+				for (blocks_read = 0;
+					block_id + blocks_read < blocks_total && blocks_read < buffer_capacity &&
+					pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
+					++blocks_read);
+
+				if (!blocks_read)
+					break;
+
+				offset = (off_t)(block_id * block_size);
+				if (lseek(dfr, offset, SEEK_SET) == (off_t)-1)
+					log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
+
+				r_size = read_all(&dfr, buffer, blocks_read * block_size, &opt);
+				if (r_size != (int)(blocks_read * block_size)) {
+					if ((r_size == -1) && (errno == EIO)) {
+						if (opt.rescue) {
+							memset(buffer, 0, blocks_read * block_size);
+							for (r_size = 0; r_size < blocks_read * block_size; r_size += PART_SECTOR_SIZE)
+								rescue_sector(&dfr, offset + r_size, buffer + r_size, &opt);
+						} else
+							log_mesg(0, 1, 1, debug, "%s", bad_sectors_warning_msg);
 					} else
-						log_mesg(0, 1, 1, debug, "%s", bad_sectors_warning_msg);
+						log_mesg(0, 1, 1, debug, "source read ERROR %s\n", strerror(errno));
+				}
+
+				/// write buffer to target
+				w_size = write_all(&dfw, buffer, blocks_read * block_size, &opt);
+				if (w_size != (int)(blocks_read * block_size)) {
+					if (opt.skip_write_error)
+						log_mesg(0, 0, 1, debug, "skip write block %lli error:%s\n", block_id, strerror(errno));
+					else
+						log_mesg(0, 1, 1, debug, "write block %lli ERROR:%s\n", block_id, strerror(errno));
+				}
+
+				/// count copied block
+				copied += blocks_read;
+
+				/// next block
+				block_id += blocks_read;
+
+				/// read or write error
+				if (r_size != w_size) {
+					if (opt.skip_write_error)
+						log_mesg(0, 0, 1, debug, "read and write different\n");
+					else
+						log_mesg(0, 1, 1, debug, "read and write different\n");
+				}
+			} while (1);
+
+			free(buffer);
+			if (empty_buffer) {
+				if (block_id < blocks_total && skip_blocks(&dfw, empty_buffer, block_size, blocks_total - block_id, &opt, &block_id) < 0) {
+					log_mesg(0, 0, 1, debug, "write empty ERROR:%s\n", strerror(errno));
+				}
+				if (block_id * block_size < fs_info.device_size && skip_bytes(&dfw, empty_buffer, block_size, fs_info.device_size - block_id * block_size, &opt) != fs_info.device_size - block_id * block_size) {
+					log_mesg(0, 0, 1, debug, "write empty ERROR:%s\n", strerror(errno));
+				}
+				free(empty_buffer);
+			}
+
+			/// restore_raw_file option
+			if (opt.restore_raw_file && !pc_test_bit(blocks_total - 1, bitmap, fs_info.totalblock)) {
+				if (ftruncate(dfw, (off_t)fs_info.device_size) == -1){
+				log_mesg(0, 0, 1, debug, "ftruncate ERROR:%s\n", strerror(errno));
+				}
+				log_mesg(1, 0, 0, debug, "ftruncate:%llu\n", (off_t)fs_info.device_size);
+			}
+
+		} else if (opt.domain) {
+
+			int cmp, nx_current = 0;
+			unsigned long long next_block_id = 0;
+			log_mesg(0, 0, 0, debug, "Total block %i\n", fs_info.totalblock);
+			log_mesg(1, 0, 0, debug, "start writing domain log...\n");
+			// write domain log comment and status line
+			dprintf(dfw, "# Domain logfile created by %s v%s\n", get_exec_name(), VERSION);
+			dprintf(dfw, "# Source: %s\n", opt.source);
+			dprintf(dfw, "# Offset: 0x%08llX\n", (unsigned long long)opt.offset_domain);
+			dprintf(dfw, "# current_pos  current_status\n");
+			dprintf(dfw, "0x%08llX     ?\n", opt.offset_domain + (fs_info.totalblock * fs_info.block_size));
+			dprintf(dfw, "#      pos        size  status\n");
+			// start logging the used/unused areas
+			cmp = pc_test_bit(0, bitmap, fs_info.totalblock);
+			for (block_id = 0; block_id <= fs_info.totalblock; block_id++) {
+				if (block_id < fs_info.totalblock) {
+					nx_current = pc_test_bit(block_id, bitmap, fs_info.totalblock);
+					if (nx_current)
+						copied++;
 				} else
-					log_mesg(0, 1, 1, debug, "source read ERROR %s\n", strerror(errno));
+					nx_current = -1;
+				if (nx_current != cmp) {
+					dprintf(dfw, "0x%08llX  0x%08llX  %c\n",
+						opt.offset_domain + (next_block_id * fs_info.block_size),
+						(block_id - next_block_id) * fs_info.block_size,
+						cmp ? '+' : '?');
+					next_block_id = block_id;
+					cmp = nx_current;
+				}
+				// don't bother updating progress
+			} /// end of for
+		} else if (opt.ddd) {
+
+			char *buffer = NULL;
+			int block_size = fs_info.block_size;
+			unsigned long long blocks_total = fs_info.totalblock;
+			int blocks_in_buffer = block_size < opt.buffer_size ? opt.buffer_size / block_size : 1;
+
+			// SHA1 for torrent info
+			FILE *tinfo = NULL;
+			torrent_generator torrent;
+					if ((opt.read_direct_io == 1) || (opt.write_direct_io == 1)){
+						ret = posix_memalign((void **)&buffer, BSIZE, (blocks_in_buffer * block_size));
+						if ( ret < 0 ){
+							log_mesg(0, 1, 1, debug, "%s, %i, memory for read posix_memalign error\n", __func__, __LINE__);
+						}
+						memset(buffer, 0, (blocks_in_buffer * block_size));
+					} else {
+						buffer = (char*)malloc(blocks_in_buffer * block_size);
+					}
+
+			if (buffer == NULL) {
+				log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
 			}
 
-			/// write buffer to target
-			w_size = write_all(&dfw, buffer, blocks_read * block_size, &opt);
-			if (w_size != (int)(blocks_read * block_size)) {
-				if (opt.skip_write_error)
-					log_mesg(0, 0, 1, debug, "skip write block %lli error:%s\n", block_id, strerror(errno));
-				else
-					log_mesg(0, 1, 1, debug, "write block %lli ERROR:%s\n", block_id, strerror(errno));
+			block_id = 0;
+
+			// init SHA1 for torrent info
+			if (opt.blockfile == 1) {
+				char torrent_name[PATH_MAX + 1] = {'\0'};
+				sprintf(torrent_name,"%s/torrent.info", target);
+				tinfo = fopen(torrent_name, "w");
+				torrent_init(&torrent, tinfo);
+				fprintf(tinfo, "block_size: %u\n", block_size);
+				fprintf(tinfo, "blocks_total: %llu\n", blocks_total);
 			}
 
-			/// count copied block
-			copied += blocks_read;
+			log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
 
-			/// next block
-			block_id += blocks_read;
+			/// start clone partition to partition
+			log_mesg(1, 0, 0, debug, "start backup data device-to-device...\n");
+			do {
+				/// scan bitmap
+				unsigned long long blocks_read;
 
-			/// read or write error
-			if (r_size != w_size) {
-				if (opt.skip_write_error)
-					log_mesg(0, 0, 1, debug, "read and write different\n");
-				else
-					log_mesg(0, 1, 1, debug, "read and write different\n");
-			}
-		} while (1);
+				/// read chunk from source
+				for (blocks_read = 0;
+					block_id + blocks_read < blocks_total && blocks_read < blocks_in_buffer &&
+					pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
+					blocks_read++);
 
-		free(buffer);
-		if (empty_buffer) {
-			if (block_id < blocks_total && skip_blocks(&dfw, empty_buffer, block_size, blocks_total - block_id, &opt, &block_id) < 0) {
-				log_mesg(0, 0, 1, debug, "write empty ERROR:%s\n", strerror(errno));
-			}
-			if (block_id * block_size < fs_info.device_size && skip_bytes(&dfw, empty_buffer, block_size, fs_info.device_size - block_id * block_size, &opt) != fs_info.device_size - block_id * block_size) {
-				log_mesg(0, 0, 1, debug, "write empty ERROR:%s\n", strerror(errno));
-			}
-			free(empty_buffer);
-		}
+				if (!blocks_read)
+					break;
 
-		/// restore_raw_file option
-		if (opt.restore_raw_file && !pc_test_bit(blocks_total - 1, bitmap, fs_info.totalblock)) {
-		    if (ftruncate(dfw, (off_t)fs_info.device_size) == -1){
-			log_mesg(0, 0, 1, debug, "ftruncate ERROR:%s\n", strerror(errno));
-		    }
-		    log_mesg(1, 0, 0, debug, "ftruncate:%llu\n", (off_t)fs_info.device_size);
-		}
+				r_size = read_all(&dfr, buffer, blocks_read * block_size, &opt);
+				if (r_size != (int)(blocks_read * block_size)) {
+					if ((r_size == -1) && (errno == EIO)) {
+						if (opt.rescue) {
+							assert(buffer != NULL);
+							memset(buffer, 0, blocks_read * block_size);
+							for (r_size = 0; r_size < blocks_read * block_size; r_size += PART_SECTOR_SIZE)
+								rescue_sector(&dfr, r_size, buffer + r_size, &opt);
+						} else
+							log_mesg(0, 1, 1, debug, "%s", bad_sectors_warning_msg);
+					} else if (r_size == 0){ // done for ddd
+						/// write buffer to target
+										if (opt.blockfile == 1){
+							// SHA1 for torrent info
+							// Not always bigger or smaller than 16MB
+							
+							// first we write out block_id * block_size for filename
+							// because when calling write_block_file
+							// we will create a new file to describe a continuous block (or buffer is full)
+							// and never write to same file again
+						torrent_start_offset(&torrent, copied * block_size);
+						torrent_end_length(&torrent, rescue_write_size);
+											
+						torrent_update(&torrent, buffer, rescue_write_size);
 
-	} else if (opt.domain) {
-
-		int cmp, nx_current = 0;
-		unsigned long long next_block_id = 0;
-		log_mesg(0, 0, 0, debug, "Total block %i\n", fs_info.totalblock);
-		log_mesg(1, 0, 0, debug, "start writing domain log...\n");
-		// write domain log comment and status line
-		dprintf(dfw, "# Domain logfile created by %s v%s\n", get_exec_name(), VERSION);
-		dprintf(dfw, "# Source: %s\n", opt.source);
-		dprintf(dfw, "# Offset: 0x%08llX\n", (unsigned long long)opt.offset_domain);
-		dprintf(dfw, "# current_pos  current_status\n");
-		dprintf(dfw, "0x%08llX     ?\n", opt.offset_domain + (fs_info.totalblock * fs_info.block_size));
-		dprintf(dfw, "#      pos        size  status\n");
-		// start logging the used/unused areas
-		cmp = pc_test_bit(0, bitmap, fs_info.totalblock);
-		for (block_id = 0; block_id <= fs_info.totalblock; block_id++) {
-			if (block_id < fs_info.totalblock) {
-				nx_current = pc_test_bit(block_id, bitmap, fs_info.totalblock);
-				if (nx_current)
-					copied++;
-			} else
-				nx_current = -1;
-			if (nx_current != cmp) {
-				dprintf(dfw, "0x%08llX  0x%08llX  %c\n",
-					opt.offset_domain + (next_block_id * fs_info.block_size),
-					(block_id - next_block_id) * fs_info.block_size,
-					cmp ? '+' : '?');
-				next_block_id = block_id;
-				cmp = nx_current;
-			}
-			// don't bother updating progress
-		} /// end of for
-	} else if (opt.ddd) {
-
-		char *buffer = NULL;
-		int block_size = fs_info.block_size;
-		unsigned long long blocks_total = fs_info.totalblock;
-		int blocks_in_buffer = block_size < opt.buffer_size ? opt.buffer_size / block_size : 1;
-
-		// SHA1 for torrent info
-		FILE *tinfo = NULL;
-		torrent_generator torrent;
-                if ((opt.read_direct_io == 1) || (opt.write_direct_io == 1)){
-                    ret = posix_memalign((void **)&buffer, BSIZE, (blocks_in_buffer * block_size));
-                    if ( ret < 0 ){
-                        log_mesg(0, 1, 1, debug, "%s, %i, memory for read posix_memalign error\n", __func__, __LINE__);
-                    }
-                    memset(buffer, 0, (blocks_in_buffer * block_size));
-                } else {
-                    buffer = (char*)malloc(blocks_in_buffer * block_size);
-                }
-
-		if (buffer == NULL) {
-			log_mesg(0, 1, 1, debug, "%s, %i, not enough memory\n", __func__, __LINE__);
-		}
-
-		block_id = 0;
-
-		// init SHA1 for torrent info
-		if (opt.blockfile == 1) {
-			char torrent_name[PATH_MAX + 1] = {'\0'};
-			sprintf(torrent_name,"%s/torrent.info", target);
-			tinfo = fopen(torrent_name, "w");
-			torrent_init(&torrent, tinfo);
-			fprintf(tinfo, "block_size: %u\n", block_size);
-			fprintf(tinfo, "blocks_total: %llu\n", blocks_total);
-		}
-
-		log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
-
-		/// start clone partition to partition
-		log_mesg(1, 0, 0, debug, "start backup data device-to-device...\n");
-		do {
-			/// scan bitmap
-			unsigned long long blocks_read;
-
-			/// read chunk from source
-			for (blocks_read = 0;
-			     block_id + blocks_read < blocks_total && blocks_read < blocks_in_buffer &&
-			     pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
-			     blocks_read++);
-
-			if (!blocks_read)
-				break;
-
-			r_size = read_all(&dfr, buffer, blocks_read * block_size, &opt);
-			if (r_size != (int)(blocks_read * block_size)) {
-				if ((r_size == -1) && (errno == EIO)) {
-					if (opt.rescue) {
-                        assert(buffer != NULL);
-						memset(buffer, 0, blocks_read * block_size);
-						for (r_size = 0; r_size < blocks_read * block_size; r_size += PART_SECTOR_SIZE)
-							rescue_sector(&dfr, r_size, buffer + r_size, &opt);
+						if (opt.torrent_only == 1) {
+							w_size = rescue_write_size;
+						} else {
+												w_size = write_block_file(target, buffer, rescue_write_size, copied*block_size, &opt);
+						}
+										} else {
+											w_size = write_all(&dfw, buffer, rescue_write_size, &opt);
+										}
+						break;
 					} else
-						log_mesg(0, 1, 1, debug, "%s", bad_sectors_warning_msg);
-				} else if (r_size == 0){ // done for ddd
-				    /// write buffer to target
-                                    if (opt.blockfile == 1){
-				        // SHA1 for torrent info
-				        // Not always bigger or smaller than 16MB
-				        
-				        // first we write out block_id * block_size for filename
-				        // because when calling write_block_file
-				        // we will create a new file to describe a continuous block (or buffer is full)
-				        // and never write to same file again
+						log_mesg(0, 1, 1, debug, "source read ERROR %s\n", strerror(errno));
+				}
+
+				/// write buffer to target
+				if (opt.blockfile == 1){
+					// SHA1 for torrent info
+					// Not always bigger or smaller than 16MB
+					
+					// first we write out block_id * block_size for filename
+					// because when calling write_block_file
+					// we will create a new file to describe a continuous block (or buffer is full)
+					// and never write to same file again
 					torrent_start_offset(&torrent, copied * block_size);
-					torrent_end_length(&torrent, rescue_write_size);
-                                        
-					torrent_update(&torrent, buffer, rescue_write_size);
+					torrent_end_length(&torrent, blocks_read * block_size);
+
+					torrent_update(&torrent, buffer, blocks_read * block_size);
 
 					if (opt.torrent_only == 1) {
-						w_size = rescue_write_size;
+						w_size = blocks_read * block_size;
 					} else {
-                                        	w_size = write_block_file(target, buffer, rescue_write_size, copied*block_size, &opt);
+					w_size = write_block_file(target, buffer, blocks_read * block_size, copied*block_size, &opt);
 					}
-                                    } else {
-                                        w_size = write_all(&dfw, buffer, rescue_write_size, &opt);
-                                    }
-				    break;
-				} else
-					log_mesg(0, 1, 1, debug, "source read ERROR %s\n", strerror(errno));
+				} else {
+					w_size = write_all(&dfw, buffer, blocks_read * block_size, &opt);
+				}
+				if (w_size != (int)(blocks_read * block_size)) {
+					if (opt.skip_write_error)
+						log_mesg(0, 0, 1, debug, "skip write block %lli error:%s\n", block_id, strerror(errno));
+					else
+						log_mesg(0, 1, 1, debug, "write block %lli ERROR:%s\n", block_id, strerror(errno));
+				}
+
+				/// count copied block
+				copied += blocks_read;
+
+				/// next block
+				block_id += blocks_read;
+
+				/// read or write error
+				if (r_size != w_size) {
+					if (opt.skip_write_error)
+						log_mesg(0, 0, 1, debug, "read and write different\n");
+					else
+						log_mesg(0, 1, 1, debug, "read and write different\n");
+				}
+			} while (1);
+
+			// finish SHA1 for torrent info
+			if (opt.blockfile == 1) {
+				torrent_final(&torrent);
 			}
 
-			/// write buffer to target
-			if (opt.blockfile == 1){
-			    // SHA1 for torrent info
-			    // Not always bigger or smaller than 16MB
-			    
-			    // first we write out block_id * block_size for filename
-			    // because when calling write_block_file
-			    // we will create a new file to describe a continuous block (or buffer is full)
-			    // and never write to same file again
-			    torrent_start_offset(&torrent, copied * block_size);
-			    torrent_end_length(&torrent, blocks_read * block_size);
+			free(buffer);
 
-			    torrent_update(&torrent, buffer, blocks_read * block_size);
-
-			    if (opt.torrent_only == 1) {
-				    w_size = blocks_read * block_size;
-			    } else {
-			 	w_size = write_block_file(target, buffer, blocks_read * block_size, copied*block_size, &opt);
-			    }
-			} else {
-			    w_size = write_all(&dfw, buffer, blocks_read * block_size, &opt);
-			}
-			if (w_size != (int)(blocks_read * block_size)) {
-				if (opt.skip_write_error)
-					log_mesg(0, 0, 1, debug, "skip write block %lli error:%s\n", block_id, strerror(errno));
-				else
-					log_mesg(0, 1, 1, debug, "write block %lli ERROR:%s\n", block_id, strerror(errno));
+			/// restore_raw_file option
+			if (opt.restore_raw_file && !pc_test_bit(blocks_total - 1, bitmap, fs_info.totalblock)) {
+				if (ftruncate(dfw, (off_t)fs_info.device_size) == -1){
+				log_mesg(0, 0, 1, debug, "ftruncate ERROR:%s\n", strerror(errno));
+				}
+				log_mesg(1, 0, 0, debug, "ftruncate:%llu\n", (off_t)fs_info.device_size);
 			}
 
-			/// count copied block
-			copied += blocks_read;
 
-			/// next block
-			block_id += blocks_read;
 
-			/// read or write error
-			if (r_size != w_size) {
-				if (opt.skip_write_error)
-					log_mesg(0, 0, 1, debug, "read and write different\n");
-				else
-					log_mesg(0, 1, 1, debug, "read and write different\n");
-			}
-		} while (1);
-
-		// finish SHA1 for torrent info
-		if (opt.blockfile == 1) {
-			torrent_final(&torrent);
 		}
-
-		free(buffer);
-
-		/// restore_raw_file option
-		if (opt.restore_raw_file && !pc_test_bit(blocks_total - 1, bitmap, fs_info.totalblock)) {
-		    if (ftruncate(dfw, (off_t)fs_info.device_size) == -1){
-			log_mesg(0, 0, 1, debug, "ftruncate ERROR:%s\n", strerror(errno));
-		    }
-		    log_mesg(1, 0, 0, debug, "ftruncate:%llu\n", (off_t)fs_info.device_size);
-		}
-
-
-
-	}
+	}//@ADD.1
 
 	done = 1;
 	pres = pthread_join(prog_thread, &p_result);
@@ -1268,4 +1535,40 @@ void *thread_update_pui(void *arg) {
 		sleep(opt.fresh);
 	}
 	pthread_exit("exit");
+}
+
+
+unsigned long long to_block_id_from_used_block_idx(unsigned long long* used_block_idxs,unsigned long long* used_block_ids, file_system_info fs_info, unsigned char *bitmap, cmd_opt *opt) {
+	unsigned long long block_id = 0;
+	unsigned long long blocks_total = fs_info.totalblock;
+	unsigned long long used_block_count=0;
+	unsigned long long blocks_skip=0;
+	unsigned long long block_size=fs_info.block_size;
+	unsigned int buffer_capacity = opt->buffer_size > block_size ? opt->buffer_size / block_size : 1; // in blocks
+	unsigned long long used_block_idx = used_block_idxs[0];
+	int cnt=0;
+	do {
+			// count bytes to skip
+			for (blocks_skip = 0;
+								block_id + blocks_skip < blocks_total &&
+								!pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
+								blocks_skip++);
+
+ 
+
+			if(blocks_skip > 0) block_id += blocks_skip;
+			if(used_block_count == used_block_idx) {
+				used_block_ids[cnt++]=block_id;
+				if(cnt>1) break;
+				used_block_idx = used_block_idxs[cnt];
+				if(used_block_idx==used_block_count) {
+					used_block_ids[cnt++]=block_id;
+					break;
+				}
+			} 
+			if(blocks_skip == 0)block_id++;
+			used_block_count++;
+	}while(1);
+
+	return block_id;
 }

@@ -75,6 +75,11 @@
 #define IO 2
 #define NO_BLOCK_DETAIL 3
 
+//@ADD
+#define RZ_HEAD 1
+#define RZ_BITMAP 2
+#define RZ_BLOCK 3
+
 const char* get_exec_name();
 
 #ifdef crc32
@@ -133,7 +138,21 @@ struct cmd_opt
     int checksum_mode;
     int reseed_checksum;
     unsigned long blocks_per_checksum;
+
+    //@ADD
+    int src_mode; // HEAD, BITMAP, BLOCK
+    char* src_head_path;    //for block
+    char* src_bitmap_path;  //for block    
+    unsigned long src_blk_beg;
+    unsigned long src_blk_end;
+
+    int tgt_mode; // HEAD, BITMAP, BLOCK
+    char* tgt_head_path;    //for block
+    char* tgt_bitmap_path;  //for block
+    unsigned long tgt_blk_beg;
+    unsigned long tgt_blk_end;
 };
+
 typedef struct cmd_opt cmd_opt;
 
 /* Disable fields alignment for struct stored in the image */
@@ -357,3 +376,5 @@ extern unsigned long long get_partition_size(int* ret);
 
 /// get partition size
 extern int  write_block_file(char* target, char *buf, unsigned long long count, unsigned long long offset, cmd_opt* opt);
+
+#define RZDBG 1

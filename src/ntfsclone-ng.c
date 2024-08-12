@@ -144,7 +144,7 @@ static void fs_open(char* device){
     ntfs = ntfs_mount(device, NTFS_MNT_RDONLY);
     if (!ntfs) {
         err = errno;
-        log_mesg(0, 1, 1, fs_opt.debug, "%s: NOT NTFS partition, ntfs mount error %i\n", __FILE__, err);
+        log_mesg(0, 1, 1, fs_opt.debug, "%s: NOT NTFS partition, ntfs mount error %i - %s\n", __FILE__, err,device);
     } else {
         
         if(fs_opt.ignore_fschk){
